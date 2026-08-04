@@ -5,7 +5,7 @@
 ;; Author: Aleksei Korolev <lllshamanlll@gmail.com>
 ;; URL: https://github.com/lllShamanlll/agent-shell-org-config
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.50.1") (acp "0.13.1") (org-roam "2.2.2"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.62.1") (acp "0.13.1") (org-roam "2.2.2"))
 ;; Keywords: tools processes outlines
 
 ;; This package is free software; you can redistribute it and/or modify
@@ -300,6 +300,20 @@ down whatever ran it."
 
 ;;; Declared projects
 
+(defun agent-shell-org-config--directory (path title)
+  "Return PATH as an existing directory, declared by the project TITLE.
+Environment variables and a leading \"/~/\" are resolved, so paths
+written as \"~/projects/foo\" or \"/~/projects/foo\" both work.
+Warns and returns nil when the result is not a directory."
+  (let ((directory (directory-file-name
+                    (file-truename
+                     (expand-file-name (substitute-in-file-name path))))))
+    (if (file-directory-p directory)
+        directory
+      (warn "Project `%s' declares ROOT `%s', which is not a directory"
+            title path)
+      nil)))
+
 (defun agent-shell-org-config-projects ()
   "Return the declared projects as plists.
 Each plist holds :title, :root, :agent and :skill-tags.  Notes
@@ -308,10 +322,10 @@ without a ROOT property are ignored."
         (mapcar
          (lambda (row)
            (pcase-let ((`(,title ,_file ,properties) row))
-             (when-let ((root (agent-shell-org-config--property properties "ROOT")))
+             (when-let* ((declared (agent-shell-org-config--property properties "ROOT"))
+                         (root (agent-shell-org-config--directory declared title)))
                (list :title title
-                     :root (directory-file-name
-                            (file-truename (expand-file-name root)))
+                     :root root
                      :agent (agent-shell-org-config--property properties "AGENT")
                      :skill-tags
                      (when-let ((tags (agent-shell-org-config--property
@@ -598,14 +612,23 @@ FILE is the agent note, BUFFER the shell the client belongs to."
             (agent-shell-org-config--make-agent-config title file))
           (agent-shell-org-config--nodes-with-tag agent-shell-org-config-tag)))
 
+(defvar agent-shell-org-config--registered nil
+  "Entries this package last added to `agent-shell-agent-configs'.
+Tracked by identity: entries of that list may be configuration
+alists or functions returning one, so they cannot be told apart by
+looking at them.")
+
 ;;;###autoload
 (defun agent-shell-org-config-refresh-agents ()
   "Rebuild the org-roam defined entries of `agent-shell-agent-configs'."
   (interactive)
-  (let ((others (seq-remove (lambda (config) (map-elt config :org-file))
-                            agent-shell-agent-configs))
-        (agents (agent-shell-org-config-agent-configs)))
-    (setq agent-shell-agent-configs (append agents others))
+  (let ((agents (agent-shell-org-config-agent-configs)))
+    (setq agent-shell-agent-configs
+          (append agents
+                  (seq-difference agent-shell-agent-configs
+                                  agent-shell-org-config--registered
+                                  #'eq)))
+    (setq agent-shell-org-config--registered agents)
     (when (called-interactively-p 'interactive)
       (message "%d agent%s defined in org-roam"
                (length agents) (if (= 1 (length agents)) "" "s")))
@@ -620,7 +643,7 @@ Warns and returns nil when the project names an unknown agent."
   (when-let* ((project (agent-shell-org-config-project-at directory))
               (name (plist-get project :agent)))
     (or (seq-find (lambda (config) (equal name (map-elt config :org-title)))
-                  agent-shell-agent-configs)
+                  agent-shell-org-config--registered)
         (progn
           (warn "Project `%s' declares unknown agent `%s'"
                 (plist-get project :title) name)
