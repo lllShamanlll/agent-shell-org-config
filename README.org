@@ -4,8 +4,9 @@ Org-roam defined agents for [[https://github.com/xenodium/agent-shell][agent-she
 
 The whole definition of a containerized agent lives in one org-roam
 note: the image it runs, the arguments its container gets, what has to
-happen before it starts and after it dies.  The skills the agent is
-given are ordinary org-roam notes too, picked up by tag.
+happen before it starts and after it dies.  Projects are declared in
+org-roam too, and say which agent and which skills they want.  Agents
+show up in the regular =agent-shell= selection list.
 
 * Requirements
 
@@ -22,28 +23,24 @@ given are ordinary org-roam notes too, picked up by tag.
 #+begin_src emacs-lisp
 (use-package agent-shell-org-config
   :straight (:host github :repo "lllShamanlll/agent-shell-org-config")
-  :after agent-shell)
+  :after agent-shell
+  :demand t)
 #+end_src
 
-** From a local checkout
-
-#+begin_src emacs-lisp
-(use-package agent-shell-org-config
-  :load-path "~/projects/agent-shell-org-config"
-  :after agent-shell)
-#+end_src
+=:demand t= matters: the package has to load when =agent-shell= loads,
+or its agents never reach the selection list.
 
 * The agent note
 
 Any org-roam node tagged =:agent:= (see
 =agent-shell-org-config-tag=) with these named source blocks:
 
-| block            | language     | required | purpose                                   |
-|------------------+--------------+----------+-------------------------------------------|
-| =dockerfile=     | dockerfile   | yes      | image built for the agent                 |
-| =config=         | elisp        | no       | extra runtime arguments (list of strings) |
-| =prerequisites=  | elisp        | no       | run right before launching                |
-| =postmortem=     | elisp        | no       | run once the agent process exits          |
+| block           | language   | required | purpose                                   |
+|-----------------+------------+----------+-------------------------------------------|
+| =dockerfile=    | dockerfile | yes      | image built for the agent                 |
+| =config=        | elisp      | no       | extra runtime arguments (list of strings) |
+| =prerequisites= | elisp      | no       | run before the container starts           |
+| =postmortem=    | elisp      | no       | run when the shell is killed              |
 
 Elisp blocks are evaluated with dynamic binding, so =prerequisites=
 can stash state in a global variable that =config= and =postmortem=
@@ -67,43 +64,89 @@ read back:
 ,#+end_src
 #+end_src
 
-The image is named after the note's title:  =Claude Container=
-becomes =agent-claude-container-v2=.
+The image is named after the note's title: =Claude Container=
+becomes =agent-claude-container-v2=.  The container is started with
+=agent-shell-org-config-acp-command= appended after the image name, so
+the image's entrypoint should =exec "$@"=.
+
+* The project note
+
+Any org-roam node tagged =:agent-project:= (see
+=agent-shell-org-config-project-tag=) declaring a project in its
+property drawer:
+
+#+begin_src org
+:PROPERTIES:
+:ID:         2f1c1f6e-...
+:ROOT:       ~/projects/Acme
+:AGENT:      Claude Container
+:SKILL_TAGS: acme
+:END:
+,#+title: Acme
+,#+filetags: :agent-project:
+#+end_src
+
+- =ROOT= (required) is mounted into the container as the project.
+- =AGENT= is the title of the agent note to use without prompting.
+- =SKILL_TAGS= narrows which skills the agent gets.
+
+Project notes exist because a declared project may span several VCS
+repositories.  Starting a shell in =~/projects/Acme/repositories/acme-web=
+mounts =~/projects/Acme=, not the inner repository that =project.el=
+would find.  Resolution:
+
+- The deepest declared project containing the current directory wins.
+- With no declared project, the projectile or =project.el= root is
+  mounted, and you are prompted for an agent as usual.
+- If =AGENT= names an agent note that does not exist, you get a warning
+  and the prompt.
+
+Choosing an agent by hand never changes which directory is mounted.
 
 * Skills
 
 Any org-roam note whose =#+filetags:= line carries =:agent-skill:=
-(see =agent-shell-org-config-skill-tag=) is handed to the session.
-A tag on a heading does not count — the tag has to be on the file.
+(see =agent-shell-org-config-skill-tag=) is handed to the session.  A
+tag on a heading does not count — the tag has to be on the file.  When
+the declared project lists =SKILL_TAGS=, only skills carrying all of
+them qualify; without a declared project, every skill note is mounted.
 
-Each run gets a fresh session directory containing the generated
-=Dockerfile= and a =notes/= directory of hard links to the skill notes
-(copies, where hard-linking fails).  That directory is mounted at
-=/data=, so skills show up as =/data/notes/*.org= inside the
+Each shell gets a fresh session directory with a =notes/= directory of
+hard links to those notes (copies, where hard-linking fails), mounted
+at =/data=.  Skills therefore show up as =/data/notes/*.org= inside the
 container.  Turning them into something the agent can use — tangling
 them into skill directories, for instance — is the image's job, done
 in its =ENTRYPOINT=.
 
-=M-x agent-shell-org-config-list-skills= shows what a session would
-pick up.
+=M-x agent-shell-org-config-list-skills= shows what a session started
+in the current directory would mount.
 
 * Running
 
-| command                              | does                                        |
-|--------------------------------------+---------------------------------------------|
-| =agent-shell-org-config-run=         | pick a note, build the image, launch a shell |
-| =agent-shell-org-config-run-debug=   | same, but run the container in vterm         |
-| =agent-shell-org-config-list-skills= | list the notes a session would mount         |
+=M-x agent-shell= and pick the agent: agents defined in org-roam appear
+alongside Claude, Gemini and the rest.  When the current directory
+belongs to a declared project naming an agent, that agent starts
+without a prompt.
 
-=agent-shell-org-config-run= with a prefix argument is the same as
-=agent-shell-org-config-run-debug=.
+| command                                | does                                          |
+|----------------------------------------+-----------------------------------------------|
+| =agent-shell-org-config-new-shell=     | start a shell, ignoring the project's =AGENT= |
+| =agent-shell-org-config-build=         | rebuild an agent's image, asynchronously      |
+| =agent-shell-org-config-run-debug=     | run the container in vterm, no ACP agent      |
+| =agent-shell-org-config-list-skills=   | list the skills a session here would mount    |
+| =agent-shell-org-config-refresh-agents= | re-read agent notes from org-roam            |
 
-The build runs asynchronously in =*Agent Image Build*=; the agent is
-only launched if it succeeds.  The project directory (projectile root,
-=project.el= root, or =default-directory=) is mounted at =/project=,
-and the shell gets a buffer-local
-=agent-shell-path-resolver-function= translating host paths under it
-into their =/project= equivalent.
+Images are built only when missing, because building blocks Emacs.
+After editing a dockerfile block, run =agent-shell-org-config-build=;
+it builds asynchronously in =*Agent Image Build*=.  Set
+=agent-shell-org-config-build-on-launch= to =t= to rebuild on every
+launch instead (fast when the image is cached, minutes when it is not).
+
+The shell gets a buffer-local =agent-shell-path-resolver-function=
+translating host paths under the mounted root into their =/project=
+equivalent.  Note that =agent-shell= does its own project detection for
+buffer names and transcripts, so a shell may be named after the inner
+repository while =/project= is the declared root.
 
 * Configuration
 
@@ -114,6 +157,7 @@ into their =/project= equivalent.
       agent-shell-org-config-project-mount "/workspace"
       agent-shell-org-config-environment '(("INSIDE_CONTAINER" . "1"))
       agent-shell-org-config-acp-command '("claude-acp")
+      agent-shell-org-config-build-on-launch t
       agent-shell-org-config-delete-session t)     ; drop session dirs on exit
 #+end_src
 

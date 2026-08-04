@@ -5,7 +5,7 @@
 ;; Author: Aleksei Korolev <lllshamanlll@gmail.com>
 ;; URL: https://github.com/lllShamanlll/agent-shell-org-config
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.50.1") (org-roam "2.2.2"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.50.1") (acp "0.13.1") (org-roam "2.2.2"))
 ;; Keywords: tools processes outlines
 
 ;; This package is free software; you can redistribute it and/or modify
@@ -24,8 +24,8 @@
 ;;; Commentary:
 ;;
 ;; Keeps the whole definition of a containerized `agent-shell' agent in
-;; org-roam: the image, the container arguments, the session lifecycle
-;; hooks and the skills the agent is given.
+;; org-roam, and adds those agents to the regular `agent-shell' agent
+;; selection list.
 ;;
 ;; An *agent note* is an org-roam node tagged with
 ;; `agent-shell-org-config-tag' (":agent:" by default) holding named
@@ -34,37 +34,50 @@
 ;;   #+NAME: dockerfile        (dockerfile) the image to build — required
 ;;   #+NAME: config            (elisp) extra runtime arguments, returns a
 ;;                             list of strings
-;;   #+NAME: prerequisites     (elisp) run before launching (ssh-agent,
-;;                             credentials, …)
-;;   #+NAME: postmortem        (elisp) run after the agent process exits
+;;   #+NAME: prerequisites     (elisp) run before the container starts
+;;   #+NAME: postmortem        (elisp) run when the shell is killed
 ;;
 ;; Elisp blocks are evaluated with dynamic binding, in order, so
 ;; `prerequisites' can stash state in a global variable that `config'
 ;; and `postmortem' read back.
 ;;
+;; A *project note* is an org-roam node tagged with
+;; `agent-shell-org-config-project-tag' (":agent-project:" by default)
+;; whose property drawer declares a project:
+;;
+;;   :ROOT:       ~/projects/Acme      ; mounted as the project — required
+;;   :AGENT:      Claude Container ; title of the agent note to default to
+;;   :SKILL_TAGS: acme                 ; which skills the agent gets
+;;
+;; Project notes exist because a declared project may span several VCS
+;; repositories: starting a shell anywhere under ROOT mounts ROOT
+;; itself, not the inner repository that `project.el' would find.  The
+;; deepest declared project containing the directory wins; without one,
+;; the projectile or `project.el' root is mounted, as usual.
+;;
 ;; A *skill note* is any org-roam node tagged with
 ;; `agent-shell-org-config-skill-tag' (":agent-skill:" by default) in
-;; its "#+filetags:" line.  Skill notes are hard-linked (copied when
-;; hard-linking is not possible) into "notes/" of a fresh session
-;; directory, which is mounted into the container — what the container
-;; does with them (tangling them into skill directories, say) is the
-;; image's business.
+;; its "#+filetags:" line.  When the declared project lists SKILL_TAGS,
+;; only skills carrying all of them are used.  Skills are hard-linked
+;; (copied when hard-linking is not possible) into "notes/" of a fresh
+;; session directory mounted into the container — turning them into
+;; something the agent can use is the image's business.
 ;;
-;; Usage:
+;; Usage: `M-x agent-shell' and pick the agent.  Agents defined in
+;; org-roam appear alongside Claude, Gemini and the rest; when the
+;; current directory belongs to a declared project naming an agent,
+;; that agent is used without prompting.  Other commands:
 ;;
-;;   M-x agent-shell-org-config-run           ; pick a note, build, launch
-;;   C-u M-x agent-shell-org-config-run       ; run the container in vterm
-;;   M-x agent-shell-org-config-run-debug     ; same, without the prefix arg
-;;   M-x agent-shell-org-config-list-skills   ; what would be mounted
-;;
-;; The launched shell gets a buffer-local
-;; `agent-shell-path-resolver-function' mapping host project paths to
-;; their in-container location, so file links in the transcript work.
+;;   M-x agent-shell-org-config-new-shell     ; always prompt, ignoring AGENT
+;;   M-x agent-shell-org-config-build         ; rebuild an agent's image
+;;   M-x agent-shell-org-config-run-debug     ; shell into the container
+;;   M-x agent-shell-org-config-list-skills   ; what would be mounted here
+;;   M-x agent-shell-org-config-refresh-agents
 
 ;;; Code:
 
+(require 'acp)
 (require 'agent-shell)
-(require 'agent-shell-anthropic)
 (require 'compile)
 (require 'org)
 (require 'org-element)
@@ -87,11 +100,13 @@
 ;;; Customization
 
 (defcustom agent-shell-org-config-tag "agent"
-  "Tag marking org-roam nodes that define an agent.
-Used to narrow the completion list of `agent-shell-org-config-run'.
-Set to nil to offer every org-roam node."
-  :type '(choice (const :tag "Offer every node" nil)
-                 (string :tag "Tag"))
+  "Tag marking org-roam nodes that define an agent."
+  :type 'string
+  :group 'agent-shell-org-config)
+
+(defcustom agent-shell-org-config-project-tag "agent-project"
+  "Tag marking org-roam nodes that declare a project."
+  :type 'string
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-skill-tag "agent-skill"
@@ -119,7 +134,7 @@ after the mounts and the environment."
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-project-mount "/project"
-  "Where the host project directory is mounted inside the container."
+  "Where the project directory is mounted inside the container."
   :type 'string
   :group 'agent-shell-org-config)
 
@@ -136,9 +151,7 @@ containers, \"\" leaves the labels alone."
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-acp-command '("claude-acp")
-  "Command starting the ACP agent *inside* the container.
-Bound to `agent-shell-anthropic-claude-acp-command' while the shell
-is created."
+  "Command starting the ACP agent *inside* the container."
   :type '(repeat string)
   :group 'agent-shell-org-config)
 
@@ -148,15 +161,29 @@ is created."
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-session-directory temporary-file-directory
-  "Directory holding per-session directories (Dockerfile plus skills)."
+  "Directory holding the per-session directories mounted into containers."
   :type 'directory
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-delete-session nil
-  "Whether to delete the session directory once the agent exits.
-Keeping it around leaves the generated Dockerfile and the mounted
-skills available for inspection."
+  "Whether to delete the session directory once the shell is killed.
+Keeping it around leaves the mounted skills available for inspection."
   :type 'boolean
+  :group 'agent-shell-org-config)
+
+(defcustom agent-shell-org-config-build-on-launch 'missing
+  "When to build an agent's image while starting its shell.
+
+Building blocks Emacs, so the default only builds images that do
+not exist yet.  Rebuild after editing a dockerfile block with
+`agent-shell-org-config-build', which builds asynchronously.
+
+  `missing' — build only when the image is not present
+  t         — build every time a shell starts
+  nil       — never build"
+  :type '(choice (const :tag "Only when missing" missing)
+                 (const :tag "Always" t)
+                 (const :tag "Never" nil))
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-dockerfile-block "dockerfile"
@@ -170,17 +197,20 @@ skills available for inspection."
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-prerequisites-block "prerequisites"
-  "Name of the elisp block evaluated before launching the container."
+  "Name of the elisp block evaluated before the container starts."
   :type 'string
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-postmortem-block "postmortem"
-  "Name of the elisp block evaluated after the agent process exits."
+  "Name of the elisp block evaluated when the shell is killed."
   :type 'string
   :group 'agent-shell-org-config)
 
 (defconst agent-shell-org-config--elisp-languages '("elisp" "emacs-lisp")
   "Languages accepted for the evaluated blocks of an agent note.")
+
+(defconst agent-shell-org-config--build-buffer "*Agent Image Build*"
+  "Buffer showing image build output.")
 
 ;;; Source blocks
 
@@ -235,6 +265,93 @@ down whatever ran it."
                     name (error-message-string err))
            nil)))
 
+(defun agent-shell-org-config--dockerfile (file title)
+  "Return the Dockerfile of the agent note FILE, titled TITLE."
+  (or (agent-shell-org-config--block-value
+       file agent-shell-org-config-dockerfile-block)
+      (user-error "Note `%s' has no `%s' block"
+                  title agent-shell-org-config-dockerfile-block)))
+
+;;; Org-roam lookups
+
+(defun agent-shell-org-config--files-with-tag (tag)
+  "Return the files of org-roam nodes tagged TAG."
+  (seq-uniq (mapcar #'car
+                    (org-roam-db-query
+                     [:select [file] :from nodes
+                      :join tags :on (= nodes:id tags:node-id)
+                      :where (= tags:tag $s1)]
+                     tag))
+            #'string=))
+
+(defun agent-shell-org-config--nodes-with-tag (tag)
+  "Return (TITLE FILE PROPERTIES) of the file-level nodes tagged TAG."
+  (org-roam-db-query
+   [:select [title file properties] :from nodes
+    :join tags :on (= nodes:id tags:node-id)
+    :where (and (= tags:tag $s1) (= nodes:level 0))]
+   tag))
+
+(defun agent-shell-org-config--property (properties name)
+  "Return the NAME property from org-roam PROPERTIES, or nil when empty."
+  (when-let ((value (cdr (assoc-string name properties t))))
+    (unless (string-empty-p (string-trim value))
+      (string-trim value))))
+
+;;; Declared projects
+
+(defun agent-shell-org-config-projects ()
+  "Return the declared projects as plists.
+Each plist holds :title, :root, :agent and :skill-tags.  Notes
+without a ROOT property are ignored."
+  (delq nil
+        (mapcar
+         (lambda (row)
+           (pcase-let ((`(,title ,_file ,properties) row))
+             (when-let ((root (agent-shell-org-config--property properties "ROOT")))
+               (list :title title
+                     :root (directory-file-name
+                            (file-truename (expand-file-name root)))
+                     :agent (agent-shell-org-config--property properties "AGENT")
+                     :skill-tags
+                     (when-let ((tags (agent-shell-org-config--property
+                                       properties "SKILL_TAGS")))
+                       (split-string tags "[ ,:]+" t))))))
+         (agent-shell-org-config--nodes-with-tag
+          agent-shell-org-config-project-tag))))
+
+(defun agent-shell-org-config-project-at (directory)
+  "Return the declared project containing DIRECTORY, if any.
+When declared projects are nested, the deepest one wins."
+  (let ((directory (file-name-as-directory
+                    (file-truename (expand-file-name directory)))))
+    (car (sort (seq-filter
+                (lambda (project)
+                  (string-prefix-p (file-name-as-directory (plist-get project :root))
+                                   directory))
+                (agent-shell-org-config-projects))
+               (lambda (a b)
+                 (> (length (plist-get a :root))
+                    (length (plist-get b :root))))))))
+
+(defun agent-shell-org-config--vcs-root (directory)
+  "Return the project root DIRECTORY belongs to, ignoring declarations."
+  (let ((default-directory (file-name-as-directory
+                            (expand-file-name directory))))
+    (directory-file-name
+     (expand-file-name
+      (or (and (bound-and-true-p projectile-mode)
+               (fboundp 'projectile-project-root)
+               (projectile-project-root))
+          (when-let ((project (project-current)))
+            (project-root project))
+          default-directory)))))
+
+(defun agent-shell-org-config-mount-root (directory)
+  "Return the directory to mount as the project for DIRECTORY."
+  (or (plist-get (agent-shell-org-config-project-at directory) :root)
+      (agent-shell-org-config--vcs-root directory)))
+
 ;;; Skills
 
 (defun agent-shell-org-config--skill-file-p (file)
@@ -251,28 +368,30 @@ down whatever ran it."
                                  ":")
                          first-heading t))))
 
-(defun agent-shell-org-config-skill-files ()
-  "Return the files of every org-roam note tagged as a skill."
-  (seq-uniq
-   (seq-filter
-    #'agent-shell-org-config--skill-file-p
-    (mapcar #'car
-            (org-roam-db-query
-             [:select [file] :from nodes
-              :join tags :on (= nodes:id tags:node-id)
-              :where (= tags:tag $s1)]
-             agent-shell-org-config-skill-tag)))
-   #'string=))
+(defun agent-shell-org-config-skill-files (&optional skill-tags)
+  "Return the files of the skill notes to mount.
+When SKILL-TAGS is non-nil, only skills carrying all of them qualify."
+  (let ((files (seq-filter #'agent-shell-org-config--skill-file-p
+                           (agent-shell-org-config--files-with-tag
+                            agent-shell-org-config-skill-tag))))
+    (dolist (tag skill-tags files)
+      (let ((tagged (agent-shell-org-config--files-with-tag tag)))
+        (setq files (seq-filter (lambda (file) (member file tagged)) files))))))
 
 ;;; Session
 
 (defun agent-shell-org-config--slug (string)
   "Return STRING as a lowercase dash separated slug."
-  (let ((slug (downcase (replace-regexp-in-string "[^A-Za-z0-9]+" "-" string))))
-    (string-trim slug "-+" "-+")))
+  (string-trim (downcase (replace-regexp-in-string "[^A-Za-z0-9]+" "-" string))
+               "-+" "-+"))
 
-(defun agent-shell-org-config--make-session (title)
-  "Create and return a fresh session directory for the agent named TITLE."
+(defun agent-shell-org-config--image-name (title)
+  "Return the image name of the agent note titled TITLE."
+  (concat agent-shell-org-config-image-prefix
+          (agent-shell-org-config--slug title)))
+
+(defun agent-shell-org-config--make-session (title skill-tags)
+  "Create a session directory for the agent TITLE, holding SKILL-TAGS skills."
   (let* ((temporary-file-directory
           (file-name-as-directory
            (expand-file-name agent-shell-org-config-session-directory)))
@@ -282,7 +401,7 @@ down whatever ran it."
                     t)))
          (notes (file-name-as-directory (expand-file-name "notes" session))))
     (make-directory notes t)
-    (dolist (file (agent-shell-org-config-skill-files))
+    (dolist (file (agent-shell-org-config-skill-files skill-tags))
       (let ((destination (expand-file-name (file-name-nondirectory file) notes)))
         (condition-case nil
             (add-name-to-file (file-truename file) destination t)
@@ -298,6 +417,75 @@ Skill notes are hard links, so the originals survive."
       (error (message "agent-shell-org-config: could not delete %s"
                       (abbreviate-file-name session))))))
 
+;;; Images
+
+(defun agent-shell-org-config--image-exists-p (image)
+  "Return non-nil when IMAGE is present in the local image store."
+  (zerop (call-process agent-shell-org-config-runtime nil nil nil
+                       "image" "inspect" image)))
+
+(defun agent-shell-org-config--make-context (dockerfile)
+  "Return a fresh build context directory holding DOCKERFILE."
+  (let ((context (file-name-as-directory (make-temp-file "agent-build-" t))))
+    (with-temp-file (expand-file-name "Dockerfile" context)
+      (insert dockerfile))
+    context))
+
+(defun agent-shell-org-config--build-synchronously (image dockerfile)
+  "Build IMAGE from DOCKERFILE, blocking until it is done."
+  (let ((context (agent-shell-org-config--make-context dockerfile))
+        (buffer (get-buffer-create agent-shell-org-config--build-buffer)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (let ((inhibit-read-only t))
+              (erase-buffer)))
+          (display-buffer buffer)
+          (message "Building %s..." image)
+          (let ((default-directory context))
+            (unless (zerop (call-process agent-shell-org-config-runtime nil buffer t
+                                         "build" "-t" image "."))
+              (user-error "Build of %s failed, see %s"
+                          image agent-shell-org-config--build-buffer)))
+          (message "Building %s...done" image))
+      (delete-directory context t))))
+
+(defun agent-shell-org-config--build-asynchronously (image dockerfile)
+  "Build IMAGE from DOCKERFILE in a compilation buffer."
+  (let* ((context (agent-shell-org-config--make-context dockerfile))
+         (default-directory context)
+         (command (format "%s build -t %s ."
+                          (shell-quote-argument agent-shell-org-config-runtime)
+                          (shell-quote-argument image)))
+         (buffer (compilation-start
+                  command nil
+                  (lambda (_) agent-shell-org-config--build-buffer)))
+         (process (get-buffer-process buffer))
+         (watcher (lambda (process _event)
+                    (unless (process-live-p process)
+                      (delete-directory context t)
+                      (unless (and (eq (process-status process) 'exit)
+                                   (zerop (process-exit-status process)))
+                        (message "Build of %s failed, see %s"
+                                 image agent-shell-org-config--build-buffer))))))
+    (with-current-buffer buffer
+      (setq-local compilation-scroll-output t))
+    (if (process-sentinel process)
+        (add-function :after (process-sentinel process) watcher)
+      (set-process-sentinel process watcher))
+    buffer))
+
+(defun agent-shell-org-config--ensure-image (image file title)
+  "Make sure IMAGE exists, building it from the agent note FILE titled TITLE.
+Honors `agent-shell-org-config-build-on-launch'."
+  (pcase agent-shell-org-config-build-on-launch
+    ('nil nil)
+    ('missing (unless (agent-shell-org-config--image-exists-p image)
+                (agent-shell-org-config--build-synchronously
+                 image (agent-shell-org-config--dockerfile file title))))
+    (_ (agent-shell-org-config--build-synchronously
+        image (agent-shell-org-config--dockerfile file title)))))
+
 ;;; Container command
 
 (defun agent-shell-org-config--mount (host container)
@@ -307,7 +495,9 @@ Skill notes are hard links, so the originals survive."
 
 (defun agent-shell-org-config--command (image project session file)
   "Return the runtime command running IMAGE for the agent note FILE.
-PROJECT and SESSION are the host directories to mount."
+PROJECT and SESSION are the host directories to mount.  The command
+stops at the image name, so a command to run inside the container
+can be appended."
   (append (list agent-shell-org-config-runtime)
           agent-shell-org-config-runtime-args
           (list "-v" (agent-shell-org-config--mount
@@ -321,187 +511,213 @@ PROJECT and SESSION are the host directories to mount."
            file agent-shell-org-config-arguments-block)
           (list image)))
 
-;;; Build
-
-(defun agent-shell-org-config--build (image session callback)
-  "Build IMAGE from the Dockerfile in SESSION, then call CALLBACK.
-CALLBACK is only called when the build succeeds."
-  (let* ((default-directory session)
-         (command (format "%s build -t %s ."
-                          (shell-quote-argument agent-shell-org-config-runtime)
-                          (shell-quote-argument image)))
-         (buffer (compilation-start command nil (lambda (_) "*Agent Image Build*")))
-         (process (get-buffer-process buffer))
-         (watcher (lambda (process _event)
-                    (unless (process-live-p process)
-                      (if (and (eq (process-status process) 'exit)
-                               (zerop (process-exit-status process)))
-                          (funcall callback)
-                        (message "Build of %s failed, see *Agent Image Build*"
-                                 image))))))
-    (with-current-buffer buffer
-      (setq-local compilation-scroll-output t))
-    (if (process-sentinel process)
-        (add-function :after (process-sentinel process) watcher)
-      (set-process-sentinel process watcher))
-    buffer))
-
-;;; Launch
-
-(defvar agent-shell-org-config--pending nil
-  "Plist describing the shell `agent-shell' is about to create.
-Holds :project, :session and :file until the new agent-shell buffer
-picks it up in `agent-shell-org-config--setup-shell'.")
-
-(defvar-local agent-shell-org-config--project nil
-  "Host project directory mounted into this buffer's container.")
-
-(defvar-local agent-shell-org-config--session nil
-  "Session directory mounted into this buffer's container.")
+;;; Shell integration
 
 (defvar-local agent-shell-org-config--file nil
   "File of the org-roam note defining this buffer's agent.")
 
+(defvar-local agent-shell-org-config--project nil
+  "Host directory mounted as the project in this buffer's container.")
+
+(defvar-local agent-shell-org-config--session nil
+  "Session directory mounted into this buffer's container.")
+
 (defun agent-shell-org-config--resolve-path (path)
-  "Map PATH from the host project directory into the container."
+  "Map PATH from the mounted project directory into the container."
   (if (and agent-shell-org-config--project
            (string-prefix-p agent-shell-org-config--project path))
       (concat agent-shell-org-config-project-mount
               (substring path (length agent-shell-org-config--project)))
     path))
 
-(defun agent-shell-org-config--teardown (buffer)
-  "Run the postmortem block of BUFFER's agent and clean its session up."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (when agent-shell-org-config--file
-        (agent-shell-org-config--eval-block-safely
-         agent-shell-org-config--file
-         agent-shell-org-config-postmortem-block))
-      (when agent-shell-org-config-delete-session
-        (agent-shell-org-config--delete-session agent-shell-org-config--session)))))
+(defun agent-shell-org-config--teardown ()
+  "Run the agent's postmortem block and clean its session up."
+  (when agent-shell-org-config--file
+    (agent-shell-org-config--eval-block-safely
+     agent-shell-org-config--file
+     agent-shell-org-config-postmortem-block))
+  (when agent-shell-org-config-delete-session
+    (agent-shell-org-config--delete-session agent-shell-org-config--session)))
 
-(defun agent-shell-org-config--setup-shell ()
-  "Configure the agent-shell buffer created for a pending launch."
-  (when agent-shell-org-config--pending
-    (let ((pending agent-shell-org-config--pending)
-          (buffer (current-buffer)))
-      (setq agent-shell-org-config--pending nil)
-      (remove-hook 'agent-shell-mode-hook #'agent-shell-org-config--setup-shell)
-      (setq-local agent-shell-org-config--project
-                  (directory-file-name (plist-get pending :project)))
-      (setq-local agent-shell-org-config--session (plist-get pending :session))
-      (setq-local agent-shell-org-config--file (plist-get pending :file))
-      (setq-local agent-shell-path-resolver-function
-                  #'agent-shell-org-config--resolve-path)
-      (when-let ((process (get-buffer-process buffer)))
-        (let ((watcher (lambda (process _event)
-                         (unless (process-live-p process)
-                           (agent-shell-org-config--teardown buffer)))))
-          (if (process-sentinel process)
-              (add-function :after (process-sentinel process) watcher)
-            (set-process-sentinel process watcher)))))))
+(defun agent-shell-org-config--prepare (title file buffer)
+  "Prepare BUFFER to run the agent titled TITLE, defined by FILE.
+Creates the session, builds the image if needed and evaluates the
+agent's prerequisites.  Does nothing when BUFFER is already prepared."
+  (with-current-buffer buffer
+    (unless agent-shell-org-config--session
+      (let* ((project (agent-shell-org-config-project-at default-directory))
+             (root (or (plist-get project :root)
+                       (agent-shell-org-config--vcs-root default-directory)))
+             (session (agent-shell-org-config--make-session
+                       title (plist-get project :skill-tags))))
+        (setq-local agent-shell-org-config--file file)
+        (setq-local agent-shell-org-config--project root)
+        (setq-local agent-shell-org-config--session session)
+        (setq-local agent-shell-path-resolver-function
+                    #'agent-shell-org-config--resolve-path)
+        (add-hook 'kill-buffer-hook #'agent-shell-org-config--teardown nil t)
+        (agent-shell-org-config--ensure-image
+         (agent-shell-org-config--image-name title) file title)
+        (agent-shell-org-config--eval-block
+         file agent-shell-org-config-prerequisites-block)))))
 
-(defun agent-shell-org-config--launch-in-vterm (image command)
-  "Run COMMAND for IMAGE in a vterm buffer instead of an agent shell."
-  (unless (require 'vterm nil t)
-    (user-error "Debug mode needs vterm"))
-  (vterm (format "*debug:%s*" image))
-  (vterm-send-string (mapconcat #'shell-quote-argument command " "))
-  (vterm-send-return))
+(defun agent-shell-org-config--make-client (title file buffer)
+  "Return an ACP client running the agent titled TITLE in its container.
+FILE is the agent note, BUFFER the shell the client belongs to."
+  (agent-shell-org-config--prepare title file buffer)
+  (let ((command (agent-shell-org-config--command
+                  (agent-shell-org-config--image-name title)
+                  (buffer-local-value 'agent-shell-org-config--project buffer)
+                  (buffer-local-value 'agent-shell-org-config--session buffer)
+                  file)))
+    (acp-make-client :command (car command)
+                     :command-params (append (cdr command)
+                                             agent-shell-org-config-acp-command)
+                     :context-buffer buffer)))
 
-(defun agent-shell-org-config--launch (image project session file debug)
-  "Launch IMAGE as defined by the agent note FILE.
-PROJECT and SESSION are the mounted host directories.  With DEBUG
-non-nil the container is run in vterm rather than in an agent shell."
-  (agent-shell-org-config--eval-block file agent-shell-org-config-prerequisites-block)
-  (let ((command (agent-shell-org-config--command image project session file)))
-    (if debug
-        (agent-shell-org-config--launch-in-vterm image command)
-      (let ((agent-shell-command-prefix command)
-            (agent-shell-anthropic-claude-acp-command
-             agent-shell-org-config-acp-command))
-        (setq agent-shell-org-config--pending
-              (list :project project :session session :file file))
-        (add-hook 'agent-shell-mode-hook #'agent-shell-org-config--setup-shell)
-        (unwind-protect
-            (agent-shell-new-shell)
-          ;; No shell was created (aborted agent selection, error, …).
-          (when agent-shell-org-config--pending
-            (setq agent-shell-org-config--pending nil)
-            (remove-hook 'agent-shell-mode-hook
-                         #'agent-shell-org-config--setup-shell)))))))
+(defun agent-shell-org-config--make-agent-config (title file)
+  "Return an agent-shell configuration for the agent TITLE defined by FILE."
+  (append
+   (agent-shell-make-agent-config
+    :identifier (intern (concat "org-" (agent-shell-org-config--slug title)))
+    :mode-line-name title
+    :buffer-name title
+    :shell-prompt (format "%s> " title)
+    :shell-prompt-regexp (concat (regexp-quote title) "> ")
+    :client-maker (lambda (buffer)
+                    (agent-shell-org-config--make-client title file buffer))
+    :install-instructions
+    (format "Install %s to run agents defined in org-roam."
+            agent-shell-org-config-runtime))
+   (list (cons :org-file file)
+         (cons :org-title title))))
 
-;;; Entry points
+(defun agent-shell-org-config-agent-configs ()
+  "Return an agent-shell configuration for every agent note."
+  (mapcar (pcase-lambda (`(,title ,file ,_properties))
+            (agent-shell-org-config--make-agent-config title file))
+          (agent-shell-org-config--nodes-with-tag agent-shell-org-config-tag)))
+
+;;;###autoload
+(defun agent-shell-org-config-refresh-agents ()
+  "Rebuild the org-roam defined entries of `agent-shell-agent-configs'."
+  (interactive)
+  (let ((others (seq-remove (lambda (config) (map-elt config :org-file))
+                            agent-shell-agent-configs))
+        (agents (agent-shell-org-config-agent-configs)))
+    (setq agent-shell-agent-configs (append agents others))
+    (when (called-interactively-p 'interactive)
+      (message "%d agent%s defined in org-roam"
+               (length agents) (if (= 1 (length agents)) "" "s")))
+    agents))
+
+(defvar agent-shell-org-config--force-prompt nil
+  "When non-nil, ignore the agent declared by the current project.")
+
+(defun agent-shell-org-config--declared-config (directory)
+  "Return the agent config declared by the project containing DIRECTORY.
+Warns and returns nil when the project names an unknown agent."
+  (when-let* ((project (agent-shell-org-config-project-at directory))
+              (name (plist-get project :agent)))
+    (or (seq-find (lambda (config) (equal name (map-elt config :org-title)))
+                  agent-shell-agent-configs)
+        (progn
+          (warn "Project `%s' declares unknown agent `%s'"
+                (plist-get project :title) name)
+          nil))))
+
+(defun agent-shell-org-config--select-config (original &rest args)
+  "Select the agent declared by the current project, or call ORIGINAL with ARGS."
+  (condition-case err
+      (agent-shell-org-config-refresh-agents)
+    (error (message "agent-shell-org-config: could not read org-roam: %s"
+                    (error-message-string err))))
+  (or (unless agent-shell-org-config--force-prompt
+        (agent-shell-org-config--declared-config default-directory))
+      (apply original args)))
+
+(advice-add 'agent-shell-select-config :around
+            #'agent-shell-org-config--select-config)
+
+;;; Commands
 
 (defun agent-shell-org-config--read-node ()
   "Read an org-roam node defining an agent."
   (org-roam-node-read
    nil
-   (when agent-shell-org-config-tag
-     (lambda (node)
-       (member agent-shell-org-config-tag (org-roam-node-tags node))))
+   (lambda (node)
+     (member agent-shell-org-config-tag (org-roam-node-tags node)))
    nil t))
 
-(defun agent-shell-org-config--project-root ()
-  "Return the host directory to mount as the agent's project."
-  (expand-file-name
-   (or (and (bound-and-true-p projectile-mode)
-            (fboundp 'projectile-project-root)
-            (projectile-project-root))
-       (when-let ((project (project-current)))
-         (project-root project))
-       default-directory)))
+;;;###autoload
+(defun agent-shell-org-config-new-shell ()
+  "Start an agent shell, prompting even when the project declares an agent."
+  (interactive)
+  (let ((agent-shell-org-config--force-prompt t))
+    (agent-shell-new-shell)))
 
 ;;;###autoload
-(defun agent-shell-org-config-run (node &optional debug)
-  "Build and launch the containerized agent defined by NODE.
-NODE is an org-roam node holding the agent's Dockerfile and its
-elisp blocks.  With a prefix argument, or DEBUG non-nil, the
-container is run in a vterm buffer instead of an agent shell."
-  (interactive (list (agent-shell-org-config--read-node) current-prefix-arg))
+(defun agent-shell-org-config-build (node)
+  "Build the container image of the agent defined by NODE.
+The build runs asynchronously in a compilation buffer."
+  (interactive (list (agent-shell-org-config--read-node)))
   (let* ((file (org-roam-node-file node))
-         (title (org-roam-node-title node))
-         (dockerfile (or (agent-shell-org-config--block-value
-                          file agent-shell-org-config-dockerfile-block)
-                         (user-error "Note `%s' has no `%s' block"
-                                     title
-                                     agent-shell-org-config-dockerfile-block)))
-         (image (concat agent-shell-org-config-image-prefix
-                        (agent-shell-org-config--slug title)))
-         (project (agent-shell-org-config--project-root))
-         (session (agent-shell-org-config--make-session title)))
-    (with-temp-file (expand-file-name "Dockerfile" session)
-      (insert dockerfile))
-    (agent-shell-org-config--build
-     image session
-     (lambda ()
-       (agent-shell-org-config--launch image project session file debug)))))
+         (title (org-roam-node-title node)))
+    (agent-shell-org-config--build-asynchronously
+     (agent-shell-org-config--image-name title)
+     (agent-shell-org-config--dockerfile file title))))
 
 ;;;###autoload
 (defun agent-shell-org-config-run-debug (node)
-  "Build the agent defined by NODE and run its container in vterm."
+  "Run the container of the agent defined by NODE in a vterm buffer.
+The container is started without the ACP command, dropping into
+whatever shell its entrypoint runs."
   (interactive (list (agent-shell-org-config--read-node)))
-  (agent-shell-org-config-run node t))
+  (unless (require 'vterm nil t)
+    (user-error "Debug runs need vterm"))
+  (let* ((file (org-roam-node-file node))
+         (title (org-roam-node-title node))
+         (image (agent-shell-org-config--image-name title))
+         (project (agent-shell-org-config-project-at default-directory))
+         (root (or (plist-get project :root)
+                   (agent-shell-org-config--vcs-root default-directory)))
+         (session (agent-shell-org-config--make-session
+                   title (plist-get project :skill-tags))))
+    (agent-shell-org-config--ensure-image image file title)
+    (agent-shell-org-config--eval-block
+     file agent-shell-org-config-prerequisites-block)
+    (vterm (format "*debug:%s*" image))
+    (vterm-send-string
+     (mapconcat #'shell-quote-argument
+                (agent-shell-org-config--command image root session file) " "))
+    (vterm-send-return)))
 
 ;;;###autoload
 (defun agent-shell-org-config-list-skills ()
-  "Show the skill notes an agent session would be given."
+  "Show the skills a session started here would mount."
   (interactive)
-  (let ((files (agent-shell-org-config-skill-files)))
-    (if (null files)
-        (message "No org-roam note is tagged :%s:"
-                 agent-shell-org-config-skill-tag)
-      (with-current-buffer (get-buffer-create "*Agent Skills*")
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert (format "%d notes tagged :%s:\n\n"
-                          (length files) agent-shell-org-config-skill-tag))
+  (let* ((project (agent-shell-org-config-project-at default-directory))
+         (skill-tags (plist-get project :skill-tags))
+         (files (agent-shell-org-config-skill-files skill-tags)))
+    (with-current-buffer (get-buffer-create "*Agent Skills*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Project: %s\n" (or (plist-get project :title)
+                                            "none declared")))
+        (insert (format "Mounted: %s\n" (agent-shell-org-config-mount-root
+                                         default-directory)))
+        (insert (format "Skills:  :%s:%s\n\n"
+                        agent-shell-org-config-skill-tag
+                        (if skill-tags
+                            (concat " + :" (string-join skill-tags ": :") ":")
+                          "")))
+        (if (null files)
+            (insert "No matching skill notes.\n")
           (dolist (file (sort files #'string<))
-            (insert (abbreviate-file-name file) "\n")))
-        (goto-char (point-min))
-        (special-mode)
-        (display-buffer (current-buffer))))))
+            (insert (abbreviate-file-name file) "\n"))))
+      (goto-char (point-min))
+      (special-mode)
+      (display-buffer (current-buffer)))))
 
 (provide 'agent-shell-org-config)
 ;;; agent-shell-org-config.el ends here
