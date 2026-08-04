@@ -11,7 +11,7 @@ show up in the regular =agent-shell= selection list.
 * Requirements
 
 - Emacs 29.1+
-- [[https://github.com/xenodium/agent-shell][agent-shell]] 0.50.1+
+- [[https://github.com/xenodium/agent-shell][agent-shell]] 0.62.1+
 - [[https://github.com/org-roam/org-roam][org-roam]] 2.2.2+
 - =podman= (or =docker=, see =agent-shell-org-config-runtime=)
 - [[https://github.com/akermu/emacs-libvterm][vterm]], only for debug runs
@@ -131,16 +131,23 @@ without a prompt.
 | command                                | does                                          |
 |----------------------------------------+-----------------------------------------------|
 | =agent-shell-org-config-new-shell=     | start a shell, ignoring the project's =AGENT= |
-| =agent-shell-org-config-build=         | rebuild an agent's image, asynchronously      |
+| =agent-shell-org-config-build=         | rebuild an agent's image (=C-u= for =--no-cache=) |
 | =agent-shell-org-config-run-debug=     | run the container in vterm, no ACP agent      |
 | =agent-shell-org-config-list-skills=   | list the skills a session here would mount    |
 | =agent-shell-org-config-refresh-agents= | re-read agent notes from org-roam            |
 
 Images are built only when missing, because building blocks Emacs.
 After editing a dockerfile block, run =agent-shell-org-config-build=;
-it builds asynchronously in =*Agent Image Build*=.  Set
-=agent-shell-org-config-build-on-launch= to =t= to rebuild on every
-launch instead (fast when the image is cached, minutes when it is not).
+it builds asynchronously in =*Agent Image Build*=.  With a prefix
+argument it builds with =--no-cache=, which you need when a build step
+fetches something that changes without the Dockerfile changing — an
+unpinned =npm install -g= or =pip install=, say.  Without it the
+runtime reuses the cached layer and the "rebuild" installs nothing
+new.
+
+Set =agent-shell-org-config-build-on-launch= to =t= to rebuild on
+every launch instead (fast when the image is cached, minutes when it
+is not).
 
 The shell gets a buffer-local =agent-shell-path-resolver-function=
 translating host paths under the mounted root into their =/project=

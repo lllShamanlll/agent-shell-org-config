@@ -464,12 +464,14 @@ Skill notes are hard links, so the originals survive."
           (message "Building %s...done" image))
       (delete-directory context t))))
 
-(defun agent-shell-org-config--build-asynchronously (image dockerfile)
-  "Build IMAGE from DOCKERFILE in a compilation buffer."
+(defun agent-shell-org-config--build-asynchronously (image dockerfile &optional no-cache)
+  "Build IMAGE from DOCKERFILE in a compilation buffer.
+With NO-CACHE non-nil, build without reusing cached layers."
   (let* ((context (agent-shell-org-config--make-context dockerfile))
          (default-directory context)
-         (command (format "%s build -t %s ."
+         (command (format "%s build%s -t %s ."
                           (shell-quote-argument agent-shell-org-config-runtime)
+                          (if no-cache " --no-cache" "")
                           (shell-quote-argument image)))
          (buffer (compilation-start
                   command nil
@@ -680,15 +682,21 @@ Warns and returns nil when the project names an unknown agent."
     (agent-shell-new-shell)))
 
 ;;;###autoload
-(defun agent-shell-org-config-build (node)
+(defun agent-shell-org-config-build (node &optional no-cache)
   "Build the container image of the agent defined by NODE.
-The build runs asynchronously in a compilation buffer."
-  (interactive (list (agent-shell-org-config--read-node)))
+The build runs asynchronously in a compilation buffer.
+
+With a prefix argument, or NO-CACHE non-nil, build without reusing
+cached layers.  Needed when a step fetches something that changes
+without the Dockerfile changing, such as installing the latest
+release of a package."
+  (interactive (list (agent-shell-org-config--read-node) current-prefix-arg))
   (let* ((file (org-roam-node-file node))
          (title (org-roam-node-title node)))
     (agent-shell-org-config--build-asynchronously
      (agent-shell-org-config--image-name title)
-     (agent-shell-org-config--dockerfile file title))))
+     (agent-shell-org-config--dockerfile file title)
+     no-cache)))
 
 ;;;###autoload
 (defun agent-shell-org-config-run-debug (node)
