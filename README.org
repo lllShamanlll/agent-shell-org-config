@@ -1,0 +1,124 @@
+#+TITLE: agent-shell-org-config
+
+Org-roam defined agents for [[https://github.com/xenodium/agent-shell][agent-shell]].
+
+The whole definition of a containerized agent lives in one org-roam
+note: the image it runs, the arguments its container gets, what has to
+happen before it starts and after it dies.  The skills the agent is
+given are ordinary org-roam notes too, picked up by tag.
+
+* Requirements
+
+- Emacs 29.1+
+- [[https://github.com/xenodium/agent-shell][agent-shell]] 0.50.1+
+- [[https://github.com/org-roam/org-roam][org-roam]] 2.2.2+
+- =podman= (or =docker=, see =agent-shell-org-config-runtime=)
+- [[https://github.com/akermu/emacs-libvterm][vterm]], only for debug runs
+
+* Installation
+
+** With =use-package= and =straight.el=
+
+#+begin_src emacs-lisp
+(use-package agent-shell-org-config
+  :straight (:host github :repo "lllShamanlll/agent-shell-org-config")
+  :after agent-shell)
+#+end_src
+
+** From a local checkout
+
+#+begin_src emacs-lisp
+(use-package agent-shell-org-config
+  :load-path "~/projects/agent-shell-org-config"
+  :after agent-shell)
+#+end_src
+
+* The agent note
+
+Any org-roam node tagged =:agent:= (see
+=agent-shell-org-config-tag=) with these named source blocks:
+
+| block            | language     | required | purpose                                   |
+|------------------+--------------+----------+-------------------------------------------|
+| =dockerfile=     | dockerfile   | yes      | image built for the agent                 |
+| =config=         | elisp        | no       | extra runtime arguments (list of strings) |
+| =prerequisites=  | elisp        | no       | run right before launching                |
+| =postmortem=     | elisp        | no       | run once the agent process exits          |
+
+Elisp blocks are evaluated with dynamic binding, so =prerequisites=
+can stash state in a global variable that =config= and =postmortem=
+read back:
+
+#+begin_src org
+,#+NAME: prerequisites
+,#+begin_src elisp
+(setq my/ssh-agent-handle (my/start-ssh-agent))
+,#+end_src
+
+,#+NAME: config
+,#+begin_src elisp
+(list "-v" (concat (car my/ssh-agent-handle) ":/ssh-auth.sock")
+      "-e" "SSH_AUTH_SOCK=/ssh-auth.sock")
+,#+end_src
+
+,#+NAME: postmortem
+,#+begin_src elisp
+(signal-process (cdr my/ssh-agent-handle) 'TERM)
+,#+end_src
+#+end_src
+
+The image is named after the note's title:  =Claude Container=
+becomes =agent-claude-container-v2=.
+
+* Skills
+
+Any org-roam note whose =#+filetags:= line carries =:agent-skill:=
+(see =agent-shell-org-config-skill-tag=) is handed to the session.
+A tag on a heading does not count — the tag has to be on the file.
+
+Each run gets a fresh session directory containing the generated
+=Dockerfile= and a =notes/= directory of hard links to the skill notes
+(copies, where hard-linking fails).  That directory is mounted at
+=/data=, so skills show up as =/data/notes/*.org= inside the
+container.  Turning them into something the agent can use — tangling
+them into skill directories, for instance — is the image's job, done
+in its =ENTRYPOINT=.
+
+=M-x agent-shell-org-config-list-skills= shows what a session would
+pick up.
+
+* Running
+
+| command                              | does                                        |
+|--------------------------------------+---------------------------------------------|
+| =agent-shell-org-config-run=         | pick a note, build the image, launch a shell |
+| =agent-shell-org-config-run-debug=   | same, but run the container in vterm         |
+| =agent-shell-org-config-list-skills= | list the notes a session would mount         |
+
+=agent-shell-org-config-run= with a prefix argument is the same as
+=agent-shell-org-config-run-debug=.
+
+The build runs asynchronously in =*Agent Image Build*=; the agent is
+only launched if it succeeds.  The project directory (projectile root,
+=project.el= root, or =default-directory=) is mounted at =/project=,
+and the shell gets a buffer-local
+=agent-shell-path-resolver-function= translating host paths under it
+into their =/project= equivalent.
+
+* Configuration
+
+#+begin_src emacs-lisp
+(setq agent-shell-org-config-runtime "docker"
+      agent-shell-org-config-runtime-args '("run" "--rm")
+      agent-shell-org-config-mount-options ""      ; no SELinux relabeling
+      agent-shell-org-config-project-mount "/workspace"
+      agent-shell-org-config-environment '(("INSIDE_CONTAINER" . "1"))
+      agent-shell-org-config-acp-command '("claude-acp")
+      agent-shell-org-config-delete-session t)     ; drop session dirs on exit
+#+end_src
+
+Everything is under =M-x customize-group RET agent-shell-org-config=.
+
+* License
+
+GPL-3.0-or-later.  See [[file:LICENSE][LICENSE]].
