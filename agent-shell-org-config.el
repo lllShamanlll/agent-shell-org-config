@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Aleksei Korolev
 
 ;; Author: Aleksei Korolev <lllshamanlll@gmail.com>
+;; Assisted-by: Claude:claude-sonnet-5
 ;; URL: https://github.com/lllShamanlll/agent-shell-org-config
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (agent-shell "0.62.1") (acp "0.13.1") (org-roam "2.2.2"))
