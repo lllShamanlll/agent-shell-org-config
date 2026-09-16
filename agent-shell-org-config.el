@@ -45,9 +45,9 @@
 ;; `agent-shell-org-config-project-tag' (":agent-project:" by default)
 ;; whose property drawer declares a project:
 ;;
-;;   :ROOT:       ~/projects/Acme      ; mounted as the project — required
-;;   :AGENT:      Claude Container ; title of the agent note to default to
-;;   :SKILL_TAGS: acme                 ; which skills the agent gets
+;;   :ROOT:       ~/projects/myapp     ; mounted as the project — required
+;;   :AGENT:      Claude Container    ; title of the agent note to default to
+;;   :SKILL_TAGS: myapp               ; which skills the agent gets
 ;;
 ;; Project notes exist because a declared project may span several VCS
 ;; repositories: starting a shell anywhere under ROOT mounts ROOT

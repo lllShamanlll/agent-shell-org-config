@@ -65,7 +65,7 @@ read back:
 #+end_src
 
 The image is named after the note's title: =Claude Container=
-becomes =agent-claude-container-v2=.  The container is started with
+becomes =agent-claude-container=.  The container is started with
 =agent-shell-org-config-acp-command= appended after the image name, so
 the image's entrypoint should =exec "$@"=.
 
@@ -78,11 +78,11 @@ property drawer:
 #+begin_src org
 :PROPERTIES:
 :ID:         2f1c1f6e-...
-:ROOT:       ~/projects/Acme
+:ROOT:       ~/projects/myapp
 :AGENT:      Claude Container
-:SKILL_TAGS: acme
+:SKILL_TAGS: myapp
 :END:
-,#+title: Acme
+,#+title: myapp
 ,#+filetags: :agent-project:
 #+end_src
 
@@ -91,9 +91,9 @@ property drawer:
 - =SKILL_TAGS= narrows which skills the agent gets.
 
 Project notes exist because a declared project may span several VCS
-repositories.  Starting a shell in =~/projects/Acme/repositories/acme-web=
-mounts =~/projects/Acme=, not the inner repository that =project.el=
-would find.  Resolution:
+repositories: starting a shell anywhere under =ROOT= mounts =ROOT=
+itself, not the inner repository that =project.el= would find.
+Resolution:
 
 - The deepest declared project containing the current directory wins.
 - With no declared project, you are offered to declare one (see below).
