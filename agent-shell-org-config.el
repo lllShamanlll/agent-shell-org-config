@@ -66,8 +66,13 @@
 ;; Usage: `M-x agent-shell' and pick the agent.  Agents defined in
 ;; org-roam appear alongside Claude, Gemini and the rest; when the
 ;; current directory belongs to a declared project naming an agent,
-;; that agent is used without prompting.  Other commands:
+;; that agent is used without prompting.  When no declared project
+;; covers the directory, you are offered to declare one — its root,
+;; name and agent are all editable.  Declining runs a plain
+;; `agent-shell' agent on the host, as if this package were not
+;; installed.  Other commands:
 ;;
+;;   M-x agent-shell-org-config-declare-project ; write a project note
 ;;   M-x agent-shell-org-config-new-shell     ; always prompt, ignoring AGENT
 ;;   M-x agent-shell-org-config-build         ; rebuild an agent's image
 ;;   M-x agent-shell-org-config-run-debug     ; shell into the container
@@ -81,6 +86,7 @@
 (require 'compile)
 (require 'org)
 (require 'org-element)
+(require 'org-id)
 (require 'org-roam)
 (require 'project)
 (require 'seq)
@@ -114,6 +120,15 @@
 Only the \"#+filetags:\" line counts; a heading tagged with it does
 not turn the whole file into a skill."
   :type 'string
+  :group 'agent-shell-org-config)
+
+(defcustom agent-shell-org-config-offer-project-declaration t
+  "Whether to offer declaring a project when none covers the directory.
+Starting a shell somewhere no project note claims prompts for a
+root, a name and an agent, and writes the project note.  Declining
+starts a plain `agent-shell' agent on the host instead, and the
+directory is not asked about again for the rest of the session."
+  :type 'boolean
   :group 'agent-shell-org-config)
 
 (defcustom agent-shell-org-config-runtime "podman"
@@ -365,6 +380,124 @@ When declared projects are nested, the deepest one wins."
   "Return the directory to mount as the project for DIRECTORY."
   (or (plist-get (agent-shell-org-config-project-at directory) :root)
       (agent-shell-org-config--vcs-root directory)))
+
+;;; Declaring projects
+
+(defconst agent-shell-org-config--no-agent-choice "(none, ask every time)"
+  "Candidate standing for \"write no AGENT property\".")
+
+(defun agent-shell-org-config-agent-titles ()
+  "Return the titles of the agent notes."
+  (mapcar #'car (agent-shell-org-config--nodes-with-tag
+                 agent-shell-org-config-tag)))
+
+(defun agent-shell-org-config--read-root (directory)
+  "Read the root of a project covering DIRECTORY.
+The proposed root is the one that would be mounted today, offered
+as editable text.  Offers to create the directory when it does not
+exist yet."
+  (let ((root (directory-file-name
+               (expand-file-name
+                (read-directory-name
+                 "Project root: "
+                 (file-name-as-directory
+                  (agent-shell-org-config--vcs-root directory)))))))
+    (unless (file-directory-p root)
+      (if (y-or-n-p (format "Directory %s does not exist.  Create it? "
+                            (abbreviate-file-name root)))
+          (make-directory root t)
+        (user-error "Project root `%s' is not a directory"
+                    (abbreviate-file-name root))))
+    (directory-file-name (file-truename root))))
+
+(defun agent-shell-org-config--read-agent ()
+  "Read the title of the agent note a project defaults to.
+Returns nil when no agent should be declared."
+  (when-let ((titles (agent-shell-org-config-agent-titles)))
+    (let* ((candidates (append titles
+                               (list agent-shell-org-config--no-agent-choice)))
+           (default (car titles))
+           (choice (completing-read (format-prompt "Agent" default)
+                                    candidates nil t nil nil default)))
+      (unless (equal choice agent-shell-org-config--no-agent-choice)
+        choice))))
+
+(defun agent-shell-org-config--read-project (directory)
+  "Read a project declaration covering DIRECTORY.
+Returns the same plist as `agent-shell-org-config-projects'."
+  (let* ((root (agent-shell-org-config--read-root directory))
+         (title (read-string "Project name: " (file-name-nondirectory root)))
+         (agent (agent-shell-org-config--read-agent))
+         (skill-tags (split-string
+                      (read-string "Skill tags (empty for every skill): ")
+                      "[ ,:]+" t)))
+    (when (string-empty-p (string-trim title))
+      (user-error "A project needs a name"))
+    (list :title (string-trim title)
+          :root root
+          :agent agent
+          :skill-tags skill-tags)))
+
+(defun agent-shell-org-config--write-project-note (project)
+  "Write a project note declaring PROJECT, return its file.
+PROJECT is a plist as returned by `agent-shell-org-config-projects'.
+The note is written to `org-roam-directory', named the way org-roam
+names its own, and added to the database right away, so the project
+takes effect without waiting for a sync."
+  (let* ((title (plist-get project :title))
+         (file (expand-file-name
+                (format "%s-%s.org"
+                        (format-time-string "%Y%m%d%H%M%S")
+                        (agent-shell-org-config--slug title))
+                (file-name-as-directory
+                 (expand-file-name org-roam-directory)))))
+    (when (file-exists-p file)
+      (user-error "Note `%s' already exists" (abbreviate-file-name file)))
+    (with-temp-file file
+      (insert ":PROPERTIES:\n"
+              ":ID:         " (org-id-new) "\n"
+              ":ROOT:       " (abbreviate-file-name (plist-get project :root)) "\n")
+      (when-let ((agent (plist-get project :agent)))
+        (insert ":AGENT:      " agent "\n"))
+      (when-let ((skill-tags (plist-get project :skill-tags)))
+        (insert ":SKILL_TAGS: " (string-join skill-tags " ") "\n"))
+      (insert ":END:\n"
+              "#+title: " title "\n"
+              "#+filetags: :" agent-shell-org-config-project-tag ":\n"))
+    (org-roam-db-update-file file)
+    file))
+
+(defvar agent-shell-org-config--declined nil
+  "Roots declared projects were declined for, for this session.
+Keeps the offer from coming back every time a shell is started in
+a directory the user wants to run host agents in.")
+
+(defun agent-shell-org-config--offer-project (directory)
+  "Offer to declare a project covering DIRECTORY, return what came of it.
+Returns the agent config of the declared project, the symbol
+`declined' when the user refused, and nil when there was nothing
+to offer or the new project names no agent."
+  (let ((root (agent-shell-org-config--vcs-root directory)))
+    (cond
+     ((not agent-shell-org-config-offer-project-declaration) nil)
+     ((agent-shell-org-config-project-at directory) nil)
+     ((null (agent-shell-org-config-agent-titles)) nil)
+     ((member root agent-shell-org-config--declined) 'declined)
+     ((not (y-or-n-p (format "No project declares %s.  Declare one? "
+                             (abbreviate-file-name root))))
+      (push root agent-shell-org-config--declined)
+      (message (concat "Running on the host; "
+                       "M-x agent-shell-org-config-declare-project to declare one"))
+      'declined)
+     (t
+      (let* ((project (agent-shell-org-config--read-project directory))
+             (file (agent-shell-org-config--write-project-note project)))
+        (message "Declared project `%s' in %s"
+                 (plist-get project :title) (abbreviate-file-name file))
+        (unless (agent-shell-org-config-project-at directory)
+          (warn "Project `%s' does not cover %s, so it is not used here"
+                (plist-get project :title) (abbreviate-file-name directory)))
+        (agent-shell-org-config--declared-config directory))))))
 
 ;;; Skills
 
@@ -651,15 +784,32 @@ Warns and returns nil when the project names an unknown agent."
                 (plist-get project :title) name)
           nil))))
 
+(defun agent-shell-org-config--host-configs ()
+  "Return the agent configs `agent-shell' knows that are not ours.
+What the selection list would hold without this package."
+  (let ((configs (if (functionp agent-shell-agent-configs)
+                     (funcall agent-shell-agent-configs)
+                   agent-shell-agent-configs)))
+    (seq-difference configs agent-shell-org-config--registered #'eq)))
+
 (defun agent-shell-org-config--select-config (original &rest args)
-  "Select the agent declared by the current project, or call ORIGINAL with ARGS."
+  "Select the agent declared by the current project, or call ORIGINAL with ARGS.
+When no project covers the current directory, offer to declare
+one; refusing hands the selection back to `agent-shell' with the
+org-roam agents taken out, so the agent runs on the host."
   (condition-case err
       (agent-shell-org-config-refresh-agents)
     (error (message "agent-shell-org-config: could not read org-roam: %s"
                     (error-message-string err))))
-  (or (unless agent-shell-org-config--force-prompt
-        (agent-shell-org-config--declared-config default-directory))
-      (apply original args)))
+  (if agent-shell-org-config--force-prompt
+      (apply original args)
+    (or (agent-shell-org-config--declared-config default-directory)
+        (pcase (agent-shell-org-config--offer-project default-directory)
+          ('declined (let ((agent-shell-agent-configs
+                            (agent-shell-org-config--host-configs)))
+                       (apply original args)))
+          ((and config (pred consp)) config)
+          (_ (apply original args))))))
 
 (advice-add 'agent-shell-select-config :around
             #'agent-shell-org-config--select-config)
@@ -673,6 +823,24 @@ Warns and returns nil when the project names an unknown agent."
    (lambda (node)
      (member agent-shell-org-config-tag (org-roam-node-tags node)))
    nil t))
+
+;;;###autoload
+(defun agent-shell-org-config-declare-project ()
+  "Write a project note covering the current directory.
+Prompts for the root to mount, the name of the project and the
+agent it defaults to, all starting from what a shell would do
+here today.  Visits the new note, so the rest of it can be
+written.  Also clears a previous refusal to declare a project
+here."
+  (interactive)
+  (let* ((directory default-directory)
+         (project (agent-shell-org-config--read-project directory))
+         (file (agent-shell-org-config--write-project-note project)))
+    (setq agent-shell-org-config--declined
+          (delete (agent-shell-org-config--vcs-root directory)
+                  agent-shell-org-config--declined))
+    (find-file file)
+    (message "Declared project `%s'" (plist-get project :title))))
 
 ;;;###autoload
 (defun agent-shell-org-config-new-shell ()

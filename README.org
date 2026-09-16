@@ -96,12 +96,47 @@ mounts =~/projects/Acme=, not the inner repository that =project.el=
 would find.  Resolution:
 
 - The deepest declared project containing the current directory wins.
-- With no declared project, the projectile or =project.el= root is
-  mounted, and you are prompted for an agent as usual.
+- With no declared project, you are offered to declare one (see below).
 - If =AGENT= names an agent note that does not exist, you get a warning
   and the prompt.
 
 Choosing an agent by hand never changes which directory is mounted.
+
+** Declaring a project
+
+Starting a shell somewhere no project note claims asks whether to
+declare one:
+
+#+begin_example
+No project declares ~/projects/foo.  Declare one? (y or n)
+#+end_example
+
+Answering =y= prompts for the three things a project note needs, each
+prefilled and editable:
+
+| prompt         | prefilled with                            |
+|----------------+-------------------------------------------|
+| =Project root= | the directory that would be mounted today |
+| =Project name= | the last component of that root           |
+| =Agent=        | completion over the agent notes           |
+| =Skill tags=   | empty, meaning every skill                |
+
+The root may be edited to a parent directory — that is the point of
+project notes — and is created if it does not exist.  The agent list
+ends with =(none, ask every time)= for projects that want the prompt.
+The note is written to =org-roam-directory=, named the way org-roam
+names its own, added to the database right away, and the shell starts
+with the agent it declares.
+
+Answering =n= hands the selection straight back to =agent-shell= with
+the org-roam agents taken out, so you get Claude, Gemini and the rest
+running on the host, exactly as if this package were not installed.
+The directory is not asked about again for the rest of the session.
+
+=M-x agent-shell-org-config-declare-project= writes the same note at
+any time, and visits it so you can fill in the body.  Set
+=agent-shell-org-config-offer-project-declaration= to =nil= to never be
+asked.
 
 * Skills
 
@@ -126,10 +161,12 @@ in the current directory would mount.
 =M-x agent-shell= and pick the agent: agents defined in org-roam appear
 alongside Claude, Gemini and the rest.  When the current directory
 belongs to a declared project naming an agent, that agent starts
-without a prompt.
+without a prompt; when no project covers it, you are offered to
+declare one.
 
 | command                                | does                                          |
 |----------------------------------------+-----------------------------------------------|
+| =agent-shell-org-config-declare-project= | write a project note for this directory     |
 | =agent-shell-org-config-new-shell=     | start a shell, ignoring the project's =AGENT= |
 | =agent-shell-org-config-build=         | rebuild an agent's image (=C-u= for =--no-cache=) |
 | =agent-shell-org-config-run-debug=     | run the container in vterm, no ACP agent      |
@@ -165,7 +202,8 @@ repository while =/project= is the declared root.
       agent-shell-org-config-environment '(("INSIDE_CONTAINER" . "1"))
       agent-shell-org-config-acp-command '("claude-acp")
       agent-shell-org-config-build-on-launch t
-      agent-shell-org-config-delete-session t)     ; drop session dirs on exit
+      agent-shell-org-config-delete-session t      ; drop session dirs on exit
+      agent-shell-org-config-offer-project-declaration nil) ; never offer
 #+end_src
 
 Everything is under =M-x customize-group RET agent-shell-org-config=.
